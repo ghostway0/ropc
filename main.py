@@ -259,5 +259,8 @@ env = SparseEnv()
 env[rax] = 4
 env[rcx] = 5
 print(uops)
-print(symeval(uops, env, matcher))
+symeval(uops, env, matcher)
+print(env)
 # we want to score stuff based on its compute and movement. basically what it captures, its SparseEnv after it completes
+
+
