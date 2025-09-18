@@ -1,7 +1,7 @@
-from ops import Ops, Register, UOp, Symbol, SparseEnv
+from ops import Ops, Register, UOp, Symbol, SparseEnv, Memory
 
 from typing import Callable, Any
-from collections import defaultdict
+from collections import defaultdict, deque
 
 # connect all rop gadgets that use the same things.
 
@@ -53,11 +53,12 @@ for g1 in gadgets:
     for g2 in gadgets:
         if g1 is g2:
             continue
-        if g1.wo & (g2.ro | g2.wo | g2.rw):
-            graph[g1].append(g2)
+        overlap = (g1.wo | g1.rw) & (g2.ro | g2.rw)
+        if overlap:
+            graph[g1].append((g2, overlap))
 
 for g, succs in graph.items():
-    print(f"{g.code} -> {[s.code for s in succs]}")
+    print(f"{g.code} -> {[s[0].code for s in succs]}")
 
 a0 = Register("a0", size=8)
 entry, code = {"a0": rax}, [UOp(Ops.SUB, [a0, 1])]
@@ -109,6 +110,8 @@ class Pattern:
                 if src != e:
                     if not isinstance(src, e):
                         return False
+            elif e == "*":
+                continue
             else:
                 if e != src:
                     return False
@@ -117,9 +120,12 @@ class Pattern:
 
 class PatternMatcher:
     def __init__(self, pats: dict[Pattern, Callable]):
-        self._pats = pats
+        self._pats = defaultdict(list)
+        for pat, f in pats.items():
+            for op in pat.ops:
+                self._pats[(op, len(pat.srcs or []))].append((pat, f))
 
-    def __call__(self, uops: list[UOp]) -> list[UOp]:
+    def rewrite_all(self, uops: list[UOp]) -> list[UOp]:
         out = []
         subst: dict[UOp, UOp] = {}
 
@@ -127,7 +133,7 @@ class PatternMatcher:
             new_srcs = [subst.get(s, s) for s in uop.srcs]
 
             replaced = False
-            for pat, f in self._pats.items():
+            for pat, f in self._pats[(uop.op, len(uop.srcs))]:
                 if pat.matches(uop):
                     r = f(uop.op, *new_srcs)
                     if r is None:
@@ -143,36 +149,35 @@ class PatternMatcher:
 
         return out
 
+    def __call__(self, uop: UOp, subst: dict[UOp, UOp]) -> Any:
+        new_srcs = [subst.get(s, s) for s in uop.srcs]
+        for pat, f in self._pats[(uop.op, len(uop.srcs))]:
+            if pat.matches(uop):
+                r = f(uop.op, *new_srcs)
+                if r is None:
+                    continue
+
+                subst[uop] = r
+                return r
+
 rax = Register("rax", size=8)
 
 u1 = UOp(Ops.SUB, [rax, 1])
-u2 = UOp(Ops.SUB, [rax, 2])
+u2 = UOp(Ops.SUB, [rcx, 5])
 u3 = UOp(Ops.SUB, [u1, u2])
 
 uops = [u1, u2, u3]
 
 def handle_sub(op, lhs, rhs):
-    new_srcs = []
+    if isinstance(lhs, int) and lhs == 0:
+        # 0 - x => -x
+        return UOp(Ops.SUB, [0, rhs])
 
-    const_sum = 0
+    if isinstance(rhs, int) and rhs == 0:
+        # x - 0 => x
+        return lhs
 
-    def collect(u):
-        nonlocal const_sum
-        if isinstance(u, int):
-            const_sum += u
-        elif isinstance(u, UOp) and u.op == Ops.SUB:
-            for s in u.srcs:
-                collect(s)
-        else:
-            new_srcs.append(u)
-
-    collect(lhs)
-    collect(rhs)
-
-    if const_sum != 0:
-        new_srcs.append(const_sum)
-
-    return UOp(Ops.SUB, new_srcs)
+    return UOp(Ops.SUB, [lhs, rhs])
 
 # last uop is assumed to be the output
 def gc(uops: list[UOp]) -> list[UOp]:
@@ -183,12 +188,15 @@ def gc(uops: list[UOp]) -> list[UOp]:
 
     stack = [uops[-1]]
     for uop in uops:
+        if not isinstance(uop, UOp): continue
+
         if uop in live or uop.op in SIDE_EFFECT_OPS:
             stack.append(uop)
 
     live.add(uops[-1])
     while stack:
         uop = stack.pop()
+        if not isinstance(uop, UOp): continue
         for src in uop.srcs:
             if isinstance(src, UOp) and src not in live:
                 live.add(src)
@@ -200,16 +208,56 @@ def gc(uops: list[UOp]) -> list[UOp]:
 
     return out
 
+
 matcher = PatternMatcher({
     Pattern([Ops.SUB], srcs=[Ops.SUB, Ops.SUB]): handle_sub,
+    Pattern([Ops.SUB], srcs=[int, int]): lambda o,lhs,rhs: lhs - rhs,
+    Pattern([Ops.SUB], srcs=[UOp, UOp]): lambda o,lhs,rhs: 0 if lhs == rhs else None,
+    Pattern([Ops.SUB], srcs=[Register, Register]): lambda o,lhs,rhs: 0 if lhs == rhs else None,
+    Pattern([Ops.ADD], srcs=[int, int]): lambda o,lhs,rhs: lhs + rhs,
 })
 
 import time
 start = time.perf_counter()
-r = gc(matcher(uops))
+r = gc(matcher.rewrite_all(uops))
 end = time.perf_counter()
 print(f"Pattern matching took {(end-start)*1e6:.1f} us")
 
 print(r)
 
 # index gadgets by their operations. have priorities + temperature
+
+def symeval(uops: list[UOp], env: SparseEnv, matcher: PatternMatcher) -> list[UOp]:
+    out = []
+    subst = {}
+
+    for u in uops:
+        new_srcs = []
+        for s in u.srcs:
+            if isinstance(s, Memory) or isinstance(s, Register):
+                v = env[s]
+                new_srcs.append(v if v is not None else s)
+            elif s in subst and subst[s] is not None:
+                new_srcs.append(subst[s])
+            else:
+                new_srcs.append(s)
+
+        u_new = UOp(u.op, new_srcs)
+        u_simplified = matcher(u_new, {})
+        out.append(u_simplified if u_simplified is not None else u_new)
+
+        subst[u] = u_simplified
+        if isinstance(u.srcs[0], Symbol):
+            env[u.srcs[0]] = u_simplified
+
+    return out
+
+# movement gadgets
+# compute gadgets
+
+env = SparseEnv()
+env[rax] = 4
+env[rcx] = 5
+print(uops)
+print(symeval(uops, env, matcher))
+# we want to score stuff based on its compute and movement. basically what it captures, its SparseEnv after it completes
