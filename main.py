@@ -3,6 +3,18 @@ from ops import Ops, Register, UOp, Symbol, SparseEnv, Memory
 from typing import Callable, Any
 from collections import defaultdict, deque
 
+def format_seconds(seconds: float) -> str:
+    ns = seconds * 1e9
+    if ns < 1_000:
+        return f"{ns:.0f} ns"
+    elif ns < 1_000_000:
+        return f"{ns/1_000:.3f} µs"
+    elif ns < 1_000_000_000:
+        return f"{ns/1_000_000:.3f} ms"
+    else:
+        return f"{seconds:.3f} s"
+
+
 # connect all rop gadgets that use the same things.
 
 # I need aliasing analysis: kill the stack at *sp+20 or *rbp+30, they may turn to be the same thing.
@@ -221,13 +233,13 @@ import time
 start = time.perf_counter()
 r = gc(matcher.rewrite_all(uops))
 end = time.perf_counter()
-print(f"Pattern matching took {(end-start)*1e6:.1f} us")
+print(format_seconds(end - start))
 
 print(r)
 
 # index gadgets by their operations. have priorities + temperature
 
-def symeval(uops: list[UOp], env: SparseEnv, matcher: PatternMatcher) -> list[UOp]:
+def symeval(uops: list[UOp], env: SparseEnv, matcher: PatternMatcher) -> tuple[list[UOp], dict[UOp, UOp]]:
     out = []
     subst = {}
 
@@ -250,17 +262,19 @@ def symeval(uops: list[UOp], env: SparseEnv, matcher: PatternMatcher) -> list[UO
         if isinstance(u.srcs[0], Symbol):
             env[u.srcs[0]] = u_simplified
 
-    return out
+    return out, subst
 
 # movement gadgets
 # compute gadgets
 
 env = SparseEnv()
 env[rax] = 4
-env[rcx] = 5
-print(uops)
+env[rcx] = 1
+import time
+start = time.perf_counter()
 symeval(uops, env, matcher)
+end = time.perf_counter()
+print(format_seconds(end - start))
+print(uops)
 print(env)
 # we want to score stuff based on its compute and movement. basically what it captures, its SparseEnv after it completes
-
-

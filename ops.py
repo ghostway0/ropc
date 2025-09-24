@@ -154,4 +154,20 @@ class SparseEnv:
 
         self._mem[key.base].set(offset, key.size, value)
 
+
+    def __str__(self) -> str:
+        regs_str = "Registers:\n"
+        for reg, val in sorted(self._regs.items()):
+            regs_str += f"  {reg}: {val}\n"
+
+        mem_str = "Memory:\n"
+        for base, interval_map in self._mem.items():
+            base_label = base if base is not None else "<None>"
+            mem_str += f"  Base {base_label}:\n"
+            for offset, size_val in interval_map.items():
+                offset_str = f"    Offset {offset}: {size_val}\n"
+                mem_str += offset_str
+
+        return regs_str + mem_str
+
 Symbol = Memory | Register
